@@ -42,29 +42,46 @@ const HomePage = () => {
   const notificationsRef = useRef(null);
   const { currentUser } = useAuth();
 
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    
+    //rate limiting check
+    if (!canSubmitForm()) {
+      return;
+    }
 
-  // Rate limiting state
-  const [lastSubmissionTime, setLastSubmissionTime] = useState(0);
-  const [submissionAttempts, setSubmissionAttempts] = useState(0);
+    //additional validation
+    if (!validator.isEmail(formData.email)) {
+      setStatus("Please enter a valid email address.");
+      return;
+    }
 
-  const onLogoutClick = async () => {
-    await handleLogout();
+    if (!validator.isLength(formData.name, { min: 2 })) {
+      setStatus("Name must be at least 2 characters long.");
+      return;
+    }
+
+    setIsSubmitting(true);
+    setStatus("");
+
+    try {
+      await addDoc(collection(db, "report"), {
+        ...formData,
+        createdAt: serverTimestamp(),
+        ipAddress: await getClientIP() // log ip for security monitoring
+      });
+
+      setFormData({ name: "", email: "", subject: "", body: "", role: "non-user", userId: currentUser.uid });
+      setStatus("Message sent successfully!");
+    } catch (error) {
+      console.error("Error sending message:", error);
+      setStatus("Failed to send message. Please try again.");
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
-  const [formData, setFormData] = useState({
-    name: "",
-    email: "",
-    subject: "",
-    body: "",
-    role: "user",
-    userId: currentUser.uid
-  });
-
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [status, setStatus] = useState("");
-
-
-  // Enhanced input validation
+  //extended input validation
   const validateInput = (name, value) => {
     switch (name) {
       case 'email':
@@ -84,6 +101,7 @@ const HomePage = () => {
     }
   };
 
+  
   const handleChange = (e) => {
     const sanitizedValue = validateInput(e.target.name, e.target.value);
     setFormData((prev) => ({
@@ -92,13 +110,34 @@ const HomePage = () => {
     }));
   };
 
+  const [formData, setFormData] = useState({
+    name: "",
+    email: "",
+    subject: "",
+    body: "",
+    role: "user",
+    userId: currentUser.uid
+  });
 
-  // Rate limiting for form submissions
+
+    //rate limiting state
+    const [lastSubmissionTime, setLastSubmissionTime] = useState(0);
+    const [submissionAttempts, setSubmissionAttempts] = useState(0);
+  
+    const onLogoutClick = async () => {
+      await handleLogout();
+    };
+
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [status, setStatus] = useState("");
+
+
+  //rate limiting for form submissions
   const canSubmitForm = () => {
     const now = Date.now();
     const timeDiff = now - lastSubmissionTime;
     
-    if (timeDiff < 30000) { // for 30 second cooldown
+    if (timeDiff < 30000) { // 30 second cooldown
       if (submissionAttempts >= 3) {
         setStatus("Too many attempts. Please wait 30 seconds.");
         return false;
@@ -111,46 +150,9 @@ const HomePage = () => {
     return true;
   };
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    
-    // Rate limiting check
-    if (!canSubmitForm()) {
-      return;
-    }
 
-    // Additional validation
-    if (!validator.isEmail(formData.email)) {
-      setStatus("Please enter a valid email address.");
-      return;
-    }
 
-    if (!validator.isLength(formData.name, { min: 2 })) {
-      setStatus("Name must be at least 2 characters long.");
-      return;
-    }
-
-    setIsSubmitting(true);
-    setStatus("");
-
-    try {
-      await addDoc(collection(db, "report"), {
-        ...formData,
-        createdAt: serverTimestamp(),
-        ipAddress: await getClientIP() // Log IP for security monitoring
-      });
-
-      setFormData({ name: "", email: "", subject: "", body: "", role: "non-user", userId: currentUser.uid });
-      setStatus("Message sent successfully!");
-    } catch (error) {
-      console.error("Error sending message:", error);
-      setStatus("Failed to send message. Please try again.");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  // Get client IP for security logging
+  //client ip for security logging
   const getClientIP = async () => {
     try {
       const response = await fetch('https://api.ipify.org?format=json');
@@ -174,7 +176,7 @@ const HomePage = () => {
     setMobileMenuOpen(!mobileMenuOpen);
   };
 
-  // Secure search query
+  //search query security
   const handleSearch = (e) => {
     e.preventDefault();
     const sanitizedQuery = DOMPurify.sanitize(searchQuery.trim());
@@ -183,7 +185,7 @@ const HomePage = () => {
     }
   };
 
-  // Secure AI question
+  //ai question security
   const handleAiSubmit = (e) => {
     e.preventDefault();
     const sanitizedQuestion = DOMPurify.sanitize(aiQuestion.trim());
@@ -201,6 +203,12 @@ const HomePage = () => {
     if (tab === 'home') navigate('/');
   };
 
+  const formatDateSafe = (date) => {
+    const dateObj = parseAnyTimestamp(date);
+    if (isNaN(dateObj.getTime())) return 'just now';
+    return formatDistanceToNow(dateObj, { addSuffix: true });
+  };
+
   const parseAnyTimestamp = (timestamp) => {
     if (!timestamp) return new Date();
     if (timestamp instanceof Date) return timestamp;
@@ -210,11 +218,6 @@ const HomePage = () => {
     return new Date();
   };
 
-  const formatDateSafe = (date) => {
-    const dateObj = parseAnyTimestamp(date);
-    if (isNaN(dateObj.getTime())) return 'just now';
-    return formatDistanceToNow(dateObj, { addSuffix: true });
-  };
 
   const markAsRead = async (notificationId) => {
     try {

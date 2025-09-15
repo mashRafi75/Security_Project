@@ -17,8 +17,10 @@ import { FaUser, FaSignOutAlt, FaEllipsisV, FaChevronDown, FaChevronUp, FaEdit,
    FaUserMd, FaRobot, FaChevronRight
  } from 'react-icons/fa';
 import { MdHealthAndSafety, MdThumbUp, MdThumbDown } from 'react-icons/md';
-
-
+import DOMPurify from 'dompurify';
+import validator from 'validator';
+import { RecaptchaVerifier, signInWithPhoneNumber } from 'firebase/auth';
+import { auth } from '../../firebase';
 
 const Blog_page = () => {
   const handleLogout = useLogout();
@@ -26,6 +28,7 @@ const Blog_page = () => {
   const onLogoutClick = async () => {
     await handleLogout();
   };
+  
   // Modern healthcare color palette
   const colors = {
     primary: '#1a73e8',
@@ -62,6 +65,13 @@ const Blog_page = () => {
   const [unreadCount, setUnreadCount] = useState(0);
   const [showNotifications, setShowNotifications] = useState(false);
   const notificationsRef = useRef(null);
+  
+  // Rate limiting state
+  const [lastSubmissionTime, setLastSubmissionTime] = useState(0);
+  const [submissionAttempts, setSubmissionAttempts] = useState(0);
+  const [commentRateLimit, setCommentRateLimit] = useState({});
+  const [showCaptcha, setShowCaptcha] = useState(false);
+  const [captchaToken, setCaptchaToken] = useState('');
 
   // Universal timestamp parser
   const parseAnyTimestamp = (timestamp) => {
@@ -80,12 +90,72 @@ const Blog_page = () => {
     return formatDistanceToNow(dateObj, { addSuffix: true });
   };
 
+  // Enhanced input validation
+  const validateInput = (name, value) => {
+    switch (name) {
+      case 'title':
+        return validator.isLength(value, { min: 5, max: 200 }) ? 
+               DOMPurify.sanitize(value) : '';
+      case 'content':
+        return validator.isLength(value, { min: 10, max: 5000 }) ? 
+               DOMPurify.sanitize(value) : '';
+      case 'comment':
+        return validator.isLength(value, { min: 1, max: 1000 }) ? 
+               DOMPurify.sanitize(value) : '';
+      case 'image':
+        return validator.isURL(value, { protocols: ['http', 'https'], require_protocol: true }) ? 
+               DOMPurify.sanitize(value) : '';
+      default:
+        return DOMPurify.sanitize(value);
+    }
+  };
+
+  // Rate limiting for form submissions
+  const canSubmitForm = (type = 'post') => {
+    const now = Date.now();
+    const timeDiff = now - lastSubmissionTime;
+    const limitConfig = {
+      post: { attempts: 1, cooldown: 30000 },
+      comment: { attempts: 1, cooldown: 10000 }
+    };
+    
+    const config = limitConfig[type];
+    
+    if (timeDiff < config.cooldown) {
+      if (submissionAttempts >= config.attempts) {
+        setError(`Too many attempts. Please wait ${config.cooldown/1000} seconds.`);
+        setShowCaptcha(true);
+        return false;
+      }
+      setSubmissionAttempts(prev => prev + 1);
+    } else {
+      setSubmissionAttempts(1);
+      setLastSubmissionTime(now);
+    }
+    return true;
+  };
+
+  // Get client IP for security logging
+  const getClientIP = async () => {
+    try {
+      const response = await fetch('https://api.ipify.org?format=json');
+      const data = await response.json();
+      return data.ip;
+    } catch (error) {
+      return 'unknown';
+    }
+  };
+
   // Fetch posts in real-time
   useEffect(() => {
     const fetchPosts = async () => {
       try {
         setLoadingPosts(true);
-        const q = query(collection(db, "posts"), where("blocked", "==", false), orderBy("createdAt", "desc"));
+        const q = query(
+          collection(db, "posts"), 
+          where("blocked", "==", false), 
+          orderBy("createdAt", "desc")
+        );
         
         const unsubscribe = onSnapshot(q, 
           (querySnapshot) => {
@@ -98,9 +168,11 @@ const Blog_page = () => {
                 comments: (data.comments || []).map(comment => ({
                   ...comment,
                   createdAt: parseAnyTimestamp(comment.createdAt),
+                  content: DOMPurify.sanitize(comment.content),
                   replies: (comment.replies || []).map(reply => ({
                     ...reply,
-                    createdAt: parseAnyTimestamp(reply.createdAt)
+                    createdAt: parseAnyTimestamp(reply.createdAt),
+                    content: DOMPurify.sanitize(reply.content)
                   }))
                 }))
               };
@@ -183,124 +255,202 @@ const Blog_page = () => {
     }));
   };
 
-
-  
-// like unlike  
-const handleFeedback = async (postId, feedbackType) => {
-  const postRef = doc(db, "posts", postId);
-  const post = posts.find(p => p.id === postId);
-  
-  try {
-    const batch = writeBatch(db);
-    
-    if (post[feedbackType]?.includes(currentUser.uid)) {
-      // User is removing their feedback
-      batch.update(postRef, {
-        [feedbackType]: arrayRemove(currentUser.uid)
-      });
-      
-      // Delete the previous notification if exists
-      const notificationQuery = query(
-        collection(db, "notifications"),
-        where("postId", "==", postId),
-        where("senderId", "==", currentUser.uid),
-        where("type", "==", "feedback")
-      );
-      
-      const snapshot = await getDocs(notificationQuery);
-      snapshot.forEach(doc => {
-        batch.delete(doc.ref);
-      });
-    } else {
-      const updates = {
-        [feedbackType]: arrayUnion(currentUser.uid)
+  // Initialize reCAPTCHA
+  useEffect(() => {
+    if (showCaptcha) {
+      const loadRecaptcha = () => {
+        window.recaptchaVerifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
+          'size': 'normal',
+          'callback': (token) => {
+            setCaptchaToken(token);
+            setShowCaptcha(false);
+          },
+          'expired-callback': () => {
+            setCaptchaToken('');
+          }
+        });
+        window.recaptchaVerifier.render();
       };
-      
-      const oppositeType = feedbackType === 'useful' ? 'notUseful' : 'useful';
-      if (post[oppositeType]?.includes(currentUser.uid)) {
-        updates[oppositeType] = arrayRemove(currentUser.uid);
-      }
-      
-      batch.update(postRef, updates);
 
-      // Only create notification if recipientId exists and it's not the current user
-      if (post.authorId && post.authorId !== currentUser.uid) {
-        const notificationRef = doc(collection(db, "notifications"));
-        batch.set(notificationRef, {
-          type: "feedback",
-          postId: postId,
-          senderId: currentUser.uid,
-          senderName: currentUser.fullName || "Anonymous",
-          senderAvatar: currentUser.photoURL || null,
-          recipientId: post.authorId, // Now guaranteed to exist
-          message: `${currentUser.fullName || "Someone"} found your post ${feedbackType === 'useful' ? 'useful' : 'not useful'}`,
-          createdAt: serverTimestamp(),
-          read: false,
-          feedbackType: feedbackType
+      if (typeof window !== 'undefined' && window.grecaptcha) {
+        loadRecaptcha();
+      } else {
+        const script = document.createElement('script');
+        script.src = 'https://www.google.com/recaptcha/api.js';
+        script.async = true;
+        script.defer = true;
+        document.body.appendChild(script);
+        script.onload = loadRecaptcha;
+      }
+    }
+  }, [showCaptcha]);
+
+  // Handle feedback with security checks
+  const handleFeedback = async (postId, feedbackType) => {
+    if (!currentUser) return;
+    
+    // Rate limiting for feedback
+    const now = Date.now();
+    const lastFeedback = commentRateLimit[`feedback_${postId}`] || 0;
+    if (now - lastFeedback < 2000) { // 2 second cooldown per post
+      setError("Please wait before giving feedback again");
+      return;
+    }
+
+    setCommentRateLimit(prev => ({
+      ...prev,
+      [`feedback_${postId}`]: now
+    }));
+
+    const postRef = doc(db, "posts", postId);
+    const post = posts.find(p => p.id === postId);
+    
+    try {
+      const batch = writeBatch(db);
+      
+      if (post[feedbackType]?.includes(currentUser.uid)) {
+        // User is removing their feedback
+        batch.update(postRef, {
+          [feedbackType]: arrayRemove(currentUser.uid)
         });
         
-        // Delete any existing feedback notification for this post from this user
-        const existingNotificationQuery = query(
+        // Delete the previous notification if exists
+        const notificationQuery = query(
           collection(db, "notifications"),
           where("postId", "==", postId),
           where("senderId", "==", currentUser.uid),
           where("type", "==", "feedback")
         );
         
-        const existingSnapshot = await getDocs(existingNotificationQuery);
-        existingSnapshot.forEach(doc => {
-          if (doc.id !== notificationRef.id) {
-            batch.delete(doc.ref);
-          }
+        const snapshot = await getDocs(notificationQuery);
+        snapshot.forEach(doc => {
+          batch.delete(doc.ref);
         });
-      }
-    }
-    
-    await batch.commit();
-  } catch (error) {
-    console.error("Error handling feedback:", error);
-    setError("Failed to process your feedback. Please try again.");
-  }
-};
+      } else {
+        const updates = {
+          [feedbackType]: arrayUnion(currentUser.uid)
+        };
+        
+        const oppositeType = feedbackType === 'useful' ? 'notUseful' : 'useful';
+        if (post[oppositeType]?.includes(currentUser.uid)) {
+          updates[oppositeType] = arrayRemove(currentUser.uid);
+        }
+        
+        batch.update(postRef, updates);
 
-  // Create new health update
+        // Only create notification if recipientId exists and it's not the current user
+        if (post.authorId && post.authorId !== currentUser.uid) {
+          const notificationRef = doc(collection(db, "notifications"));
+          batch.set(notificationRef, {
+            type: "feedback",
+            postId: postId,
+            senderId: currentUser.uid,
+            senderName: currentUser.fullName || "Anonymous",
+            senderAvatar: currentUser.photoURL || null,
+            recipientId: post.authorId,
+            message: `${currentUser.fullName || "Someone"} found your post ${feedbackType === 'useful' ? 'useful' : 'not useful'}`,
+            createdAt: serverTimestamp(),
+            read: false,
+            feedbackType: feedbackType,
+            ipAddress: await getClientIP()
+          });
+          
+          // Delete any existing feedback notification for this post from this user
+          const existingNotificationQuery = query(
+            collection(db, "notifications"),
+            where("postId", "==", postId),
+            where("senderId", "==", currentUser.uid),
+            where("type", "==", "feedback")
+          );
+          
+          const existingSnapshot = await getDocs(existingNotificationQuery);
+          existingSnapshot.forEach(doc => {
+            if (doc.id !== notificationRef.id) {
+              batch.delete(doc.ref);
+            }
+          });
+        }
+      }
+      
+      await batch.commit();
+    } catch (error) {
+      console.error("Error handling feedback:", error);
+      setError("Failed to process your feedback. Please try again.");
+    }
+  };
+
+  // Create new health update with security validation
   const handleSubmitPost = async (e) => {
     e.preventDefault();
-    if (!newPost.title || !newPost.content) return;
+    
+    // Rate limiting check
+    if (!canSubmitForm('post')) {
+      return;
+    }
+
+    // CAPTCHA verification for suspicious activity
+    if (submissionAttempts >= 1 && !captchaToken) {
+      setShowCaptcha(true);
+      setError("Please complete the CAPTCHA to continue");
+      return;
+    }
+
+    // Input validation
+    const validatedTitle = validateInput('title', newPost.title);
+    const validatedContent = validateInput('content', newPost.content);
+    const validatedImage = newPost.image ? validateInput('image', newPost.image) : '';
+
+    if (!validatedTitle || !validatedContent) {
+      setError("Invalid input. Please check your post content.");
+      return;
+    }
+
+    if (newPost.image && !validatedImage) {
+      setError("Please provide a valid image URL");
+      return;
+    }
     
     try {
       if (editingPost) {
         await updateDoc(doc(db, "posts", editingPost), {
-          title: newPost.title,
+          title: validatedTitle,
           genre: newPost.genre,
-          content: newPost.content,
-          image: newPost.image,
-          updatedAt: serverTimestamp()
+          content: validatedContent,
+          image: validatedImage,
+          updatedAt: serverTimestamp(),
+          lastEditedBy: currentUser.uid,
+          editTimestamp: serverTimestamp()
         });
         setEditingPost(null);
       } else {
         await addDoc(collection(db, "posts"), {
-          title: newPost.title,
+          title: validatedTitle,
           genre: newPost.genre,
           authorId: currentUser.uid,
           authorName: currentUser.fullName || currentUser.email,
           authorAvatar: currentUser.photoURL || `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.fullName || currentUser.email.split('@')[0])}`,
-          content: newPost.content,
-          image: newPost.image,
+          content: validatedContent,
+          image: validatedImage,
           blocked: false,
           useful: [],
           notUseful: [],
           comments: [],
           createdAt: serverTimestamp(),
           updatedAt: null,
-          location: "Medical Center"
+          location: "Medical Center",
+          ipAddress: await getClientIP(),
+          userAgent: navigator.userAgent,
+          captchaToken: captchaToken || null
         });
       }
       
       setNewPost({ title: '', genre: 'Health Tips', content: '', image: '' });
       setShowCreatePost(false);
+      setCaptchaToken('');
+      //setSubmissionAttempts(0);
     } catch (err) {
-      setError("Failed to share health update");
+      console.error("Error submitting post:", err);
+      setError("Failed to share health update. Please try again.");
     }
   };
 
@@ -323,10 +473,28 @@ const handleFeedback = async (postId, feedbackType) => {
     await updateDoc(notificationRef, { read: true });
   };
 
-  // Add comment or reply
+  // Add comment or reply with security validation
   const addComment = async (postId, content, isReply = false, commentId = null) => {
     if (!content.trim()) {
       setError("Comment cannot be empty");
+      return;
+    }
+
+    // Rate limiting check
+    if (!canSubmitForm('comment')) {
+      return;
+    }
+
+    // CAPTCHA verification for suspicious activity
+    if (submissionAttempts >= 5 && !captchaToken) {
+      setShowCaptcha(true);
+      setError("Please complete the CAPTCHA to continue");
+      return;
+    }
+
+    const validatedContent = validateInput('comment', content);
+    if (!validatedContent) {
+      setError("Invalid comment content");
       return;
     }
   
@@ -338,9 +506,11 @@ const handleFeedback = async (postId, feedbackType) => {
         authorId: currentUser.uid,
         authorName: currentUser.fullName || currentUser.email.split('@')[0],
         authorAvatar: currentUser.photoURL || `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.fullName || currentUser.email.split('@')[0])}`,
-        content: content.trim(),
+        content: validatedContent,
         createdAt: new Date().toISOString(),
-        replies: []
+        replies: [],
+        ipAddress: await getClientIP(),
+        userAgent: navigator.userAgent
       };
 
       if (isReply && commentId) {
@@ -358,7 +528,8 @@ const handleFeedback = async (postId, feedbackType) => {
             commentId,
             message: `${currentUser.fullName || "Someone"} replied to your comment`,
             read: false,
-            createdAt: serverTimestamp()
+            createdAt: serverTimestamp(),
+            ipAddress: await getClientIP()
           });
         }
         
@@ -385,7 +556,8 @@ const handleFeedback = async (postId, feedbackType) => {
             postId,
             message: `${currentUser.fullName || "Someone"} commented on your post`,
             read: false,
-            createdAt: serverTimestamp()
+            createdAt: serverTimestamp(),
+            ipAddress: await getClientIP()
           });
         }
         
@@ -397,19 +569,29 @@ const handleFeedback = async (postId, feedbackType) => {
       }
       
       setError(null);
+      setCaptchaToken('');
+      setSubmissionAttempts(0);
     } catch (err) {
       console.error("Error adding comment:", err);
       setError("Failed to add comment. Please try again.");
     }
   };
 
-  // Delete comment
+  // Delete comment with security check
   const deleteComment = async (postId, commentId) => {
+    if (!window.confirm("Are you sure you want to delete this comment?")) return;
+
     try {
       const postRef = doc(db, "posts", postId);
       const post = posts.find(p => p.id === postId);
       const comment = post.comments.find(c => c.id === commentId);
       
+      // Security check: Only allow deletion by author or admin
+      if (comment.authorId !== currentUser.uid && currentUser.role !== 'admin') {
+        setError("You are not authorized to delete this comment");
+        return;
+      }
+
       // Create notification for comment author if it's not the current user
       if (comment.authorId !== currentUser.uid) {
         await addDoc(collection(db, "notifications"), {
@@ -422,7 +604,8 @@ const handleFeedback = async (postId, feedbackType) => {
           commentId,
           message: `Your comment was deleted by ${currentUser.fullName || "an admin"}`,
           read: false,
-          createdAt: serverTimestamp()
+          createdAt: serverTimestamp(),
+          ipAddress: await getClientIP()
         });
       }
       
@@ -435,8 +618,10 @@ const handleFeedback = async (postId, feedbackType) => {
     }
   };
 
-  // Delete reply
+  // Delete reply with security check
   const deleteReply = async (postId, commentId, replyId) => {
+    if (!window.confirm("Are you sure you want to delete this reply?")) return;
+
     try {
       const postRef = doc(db, "posts", postId);
       const post = posts.find(p => p.id === postId);
@@ -445,6 +630,12 @@ const handleFeedback = async (postId, feedbackType) => {
         if (comment.id === commentId) {
           const reply = comment.replies.find(r => r.id === replyId);
           
+          // Security check: Only allow deletion by author or admin
+          if (reply.authorId !== currentUser.uid && currentUser.role !== 'admin') {
+            setError("You are not authorized to delete this reply");
+            return comment;
+          }
+
           // Create notification for reply author if it's not the current user
           if (reply && reply.authorId !== currentUser.uid) {
             addDoc(collection(db, "notifications"), {
@@ -458,7 +649,8 @@ const handleFeedback = async (postId, feedbackType) => {
               replyId,
               message: `Your reply was deleted by ${currentUser.fullName || "an admin"}`,
               read: false,
-              createdAt: serverTimestamp()
+              createdAt: serverTimestamp(),
+              ipAddress: getClientIP()
             });
           }
           
@@ -573,7 +765,8 @@ const handleFeedback = async (postId, feedbackType) => {
                     notifications
                       .filter(n => !n.read)
                       .map(n => markAsRead(n.id))
-            )}}
+                  );
+                }}
               >
                 Mark all as read
               </button>
@@ -600,9 +793,6 @@ const handleFeedback = async (postId, feedbackType) => {
                 }}
                 onClick={async () => {
                   await markAsRead(notification.id);
-                  // Navigate to the relevant post/comment
-                  // You'll need to implement this based on your routing
-                  // history.push(`/post/${notification.postId}`);
                   setShowNotifications(false);
                 }}
               >
@@ -616,6 +806,9 @@ const handleFeedback = async (postId, feedbackType) => {
                       borderRadius: '50%',
                       objectFit: 'cover'
                     }}
+                    onError={(e) => {
+                      e.target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(notification.senderName)}`;
+                    }}
                   />
                   <div style={{ flex: 1 }}>
                     <div style={{ 
@@ -625,7 +818,7 @@ const handleFeedback = async (postId, feedbackType) => {
                       marginBottom: '4px'
                     }}>
                       <strong style={{ fontSize: '0.9rem', color: colors.text }}>
-                        {notification.senderName}
+                        {DOMPurify.sanitize(notification.senderName)}
                       </strong>
                       {!notification.read && (
                         <span style={{
@@ -642,7 +835,7 @@ const handleFeedback = async (postId, feedbackType) => {
                       fontSize: '0.9rem',
                       color: colors.text
                     }}>
-                      {notification.message}
+                      {DOMPurify.sanitize(notification.message)}
                     </p>
                     <div style={{ 
                       fontSize: '0.75rem',
@@ -688,6 +881,7 @@ const handleFeedback = async (postId, feedbackType) => {
       color: colors.accent,
     },
   };
+
   // Healthcare categories
   const healthCategories = [
     'Health Tips', 
@@ -723,49 +917,100 @@ const handleFeedback = async (postId, feedbackType) => {
     );
   }
 
-  if (error) {
-    return (
-      <div style={{
-        padding: '40px',
-        textAlign: 'center',
-        maxWidth: '500px',
-        margin: '0 auto'
-      }}>
-        <MdHealthAndSafety size={48} style={{ color: colors.danger, marginBottom: '15px' }} />
-        <h3 style={{ color: colors.danger, margin: '0 0 10px 0' }}>Error Loading Content</h3>
-        <p style={{ color: colors.darkGray, marginBottom: '20px' }}>
-          {filter === 'All' 
-            ? 'Be the first to share a health update!' 
-            : `No updates in ${filter} category yet.`}
-        </p>
-        <button 
-          style={{
-            backgroundColor: colors.primary,
-            color: colors.white,
-            border: 'none',
-            padding: '10px 15px',
-            borderRadius: '8px',
-            fontWeight: '600',
-            cursor: 'pointer',
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: '8px'
-          }}
-          onClick={() => setShowCreatePost(true)}
-        >
-          Share Your Experience
-        </button>
-      </div>
-    );
-  }
-
   return (
     <div style={{
       minHeight: '100vh',
       backgroundColor: colors.lightGray,
-          fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif",
+      fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif",
       overflowX: 'hidden'
     }}>
+      {/* Security Headers */}
+      <meta httpEquiv="Content-Security-Policy" content="
+  default-src 'self'; 
+  script-src 'self' 'unsafe-inline' https://www.google.com/recaptcha/ https://www.gstatic.com/ https://www.google.com/; 
+  style-src 'self' 'unsafe-inline' https://www.gstatic.com/; 
+  img-src 'self' data: https:; 
+  connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://www.google.com/;
+  frame-src https://www.google.com/;
+" />
+      <meta httpEquiv="X-Content-Type-Options" content="nosniff" />
+      <meta httpEquiv="X-Frame-Options" content="DENY" />
+      <meta httpEquiv="X-XSS-Protection" content="1; mode=block" />
+
+      {/* Error Display */}
+      {error && (
+        <div style={{
+          position: 'fixed',
+          top: '20px',
+          left: '50%',
+          transform: 'translateX(-50%)',
+          backgroundColor: colors.danger,
+          color: colors.white,
+          padding: '12px 20px',
+          borderRadius: '8px',
+          zIndex: 2000,
+          display: 'flex',
+          alignItems: 'center',
+          gap: '10px',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.2)'
+        }}>
+          <span>{error}</span>
+          <button 
+            onClick={() => setError(null)}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: colors.white,
+              cursor: 'pointer',
+              fontSize: '1.2rem'
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* CAPTCHA Container */}
+      {showCaptcha && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.7)',
+          zIndex: 2000,
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center'
+        }}>
+          <div style={{
+            backgroundColor: colors.white,
+            padding: '20px',
+            borderRadius: '8px',
+            textAlign: 'center'
+          }}>
+            <h3>Security Verification</h3>
+            <p>Please complete the CAPTCHA to continue</p>
+            <div id="recaptcha-container"></div>
+            <button 
+              onClick={() => setShowCaptcha(false)}
+              style={{
+                marginTop: '15px',
+                padding: '8px 16px',
+                backgroundColor: colors.danger,
+                color: colors.white,
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer'
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Mobile Navigation */}
       {isMobile && (
         <div style={{
@@ -879,32 +1124,38 @@ const handleFeedback = async (postId, feedbackType) => {
               Medicals
             </button>
 
-              <div style={{backgroundColor: colors.primary, color: colors.white,
-                border: 'none', padding: '7px 1px',
-                borderRadius: '6px', fontWeight: '600',
-                cursor: 'pointer', display: 'inline-flex',
-                alignItems: 'center', justifyContent: 'center',
-                gap: '8px', width: '100%' }}>
-                <img 
-                  src={currentUser.photoURL || `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.fullName || currentUser.email.split('@')[0])}`} 
-                  alt={currentUser.fullName} 
-                  style={{
-                    width: '30px',
-                    height: '30px',
-                    borderRadius: '50%',
-                    objectFit: 'cover',
-                    border: `.5px solid ${colors.white}`
-                    
-                  }}
-                />
-<span 
- // style={{ fontWeight: '500', cursor: 'pointer', color:'white' }} 
-  onClick={() => navigate(`/profile/${currentUser.uid}`)}
->
-  {currentUser.fullName || currentUser.email}
-</span>
-              </div> 
-
+            <div style={{
+              backgroundColor: colors.primary, 
+              color: colors.white,
+              border: 'none', 
+              padding: '7px 1px',
+              borderRadius: '6px', 
+              fontWeight: '600',
+              cursor: 'pointer', 
+              display: 'inline-flex',
+              alignItems: 'center', 
+              justifyContent: 'center',
+              gap: '8px', 
+              width: '100%' 
+            }}>
+              <img 
+                src={currentUser.photoURL || `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.fullName || currentUser.email.split('@')[0])}`} 
+                alt={currentUser.fullName} 
+                style={{
+                  width: '30px',
+                  height: '30px',
+                  borderRadius: '50%',
+                  objectFit: 'cover',
+                  border: `.5px solid ${colors.white}`
+                }}
+                onError={(e) => {
+                  e.target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.fullName || currentUser.email.split('@')[0])}`;
+                }}
+              />
+              <span onClick={() => navigate(`/profile/${currentUser.uid}`)}>
+                {currentUser.fullName || currentUser.email}
+              </span>
+            </div> 
 
             <button 
               style={{
@@ -921,7 +1172,7 @@ const handleFeedback = async (postId, feedbackType) => {
                 gap: '8px',
                 width: '100%'
               }}
-              onClick={() => onLogoutClick}
+              onClick={onLogoutClick}
             >
               <FaSignOutAlt /> Sign Out
             </button>
@@ -932,61 +1183,62 @@ const handleFeedback = async (postId, feedbackType) => {
       {/* Desktop Navigation */}
       {!isMobile && (
         <div style={{
-    display: 'flex',
-    width: '100%', 
-    justifyContent: 'space-between', 
-    alignItems: 'center', 
-    padding: '20px', 
-    backgroundColor: 'white', 
-    borderBottom: '1px solid #e2e8f0', 
-    marginBottom: '24px', 
-    boxShadow: '0 1px 3px rgba(0,0,0,0.05)', 
-    boxSizing: 'border-box' 
+          display: 'flex',
+          width: '100%', 
+          justifyContent: 'space-between', 
+          alignItems: 'center', 
+          padding: '20px', 
+          backgroundColor: 'white', 
+          borderBottom: '1px solid #e2e8f0', 
+          marginBottom: '24px', 
+          boxShadow: '0 1px 3px rgba(0,0,0,0.05)', 
+          boxSizing: 'border-box' 
         }}>
 
-        <div style={logoStyle} onClick={() => navigate('/')}>
-          <MdHealthAndSafety style={{ fontSize: '1.5em' }} />
-          <span>SympticAI</span>
-        </div>
+          <div style={logoStyle} onClick={() => navigate('/')}>
+            <MdHealthAndSafety style={{ fontSize: '1.5em' }} />
+            <span>SympticAI</span>
+          </div>
 
-<button
-  style={{
-    backgroundColor: '#2d8e47', // Modern green shade
-    color: 'white',
-    border: 'none',
-    padding: '10px',
-    borderRadius: '50%', // Makes it circular
-    fontSize: '18px',
-    cursor: 'pointer',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    width: '48px', // Ensures a consistent round shape
-    height: '48px',
-    transition: 'background-color 0.3s ease, transform 0.2s ease',
-    boxShadow: '0px 4px 8px rgba(0, 0, 0, 0.1)',
-    marginRight: '170px',
-    marginLeft: '20px'
-  }}
-  onClick={() => {
-    setShowCreatePost(!showCreatePost);
-    setEditingPost(null);
-    setNewPost({ title: '', genre: 'Health Tips', content: '', image: '' });
-  }}
-  onMouseOver={(e) => {
-    e.target.style.backgroundColor = '#248f3c';
-    e.target.style.transform = 'scale(1.1)';
-  }}
-  onMouseOut={(e) => {
-    e.target.style.backgroundColor = '#2d8e47';
-    e.target.style.transform = 'scale(1)';
-  }}
->
-  {showCreatePost ? <FiX /> : <FiPlus />}
-</button>
+          <button
+            style={{
+              backgroundColor: '#2d8e47',
+              color: 'white',
+              border: 'none',
+              padding: '10px',
+              borderRadius: '50%',
+              fontSize: '18px',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: '48px',
+              height: '48px',
+              transition: 'background-color 0.3s ease, transform 0.2s ease',
+              boxShadow: '0px 4px 8px rgba(0, 0, 0, 0.1)',
+              marginRight: '170px',
+              marginLeft: '20px'
+            }}
+            onClick={() => {
+              setShowCreatePost(!showCreatePost);
+              setEditingPost(null);
+              setNewPost({ title: '', genre: 'Health Tips', content: '', image: '' });
+            }}
+            onMouseOver={(e) => {
+              e.target.style.backgroundColor = '#248f3c';
+              e.target.style.transform = 'scale(1.1)';
+            }}
+            onMouseOut={(e) => {
+              e.target.style.backgroundColor = '#2d8e47';
+              e.target.style.transform = 'scale(1)';
+            }}
+          >
+            {showCreatePost ? <FiX /> : <FiPlus />}
+          </button>
 
-            <button style={navButtonStyle} onClick={() => navigate('/Home_page')}>
-            <FiHome  style={{ marginRight: '0.5rem' }} /> Home </button>
+          <button style={navButtonStyle} onClick={() => navigate('/Home_page')}>
+            <FiHome  style={{ marginRight: '0.5rem' }} /> Home 
+          </button>
 
           <button
             style={navButtonStyle}
@@ -1003,42 +1255,36 @@ const handleFeedback = async (postId, feedbackType) => {
             Blogs
           </button>
           
-<button
-  style={navButtonStyle}
-  onClick={() => navigate('/MedicalList')}
->
-  <FiHeart style={{ marginRight: '0.5rem' }} />
-  Medicals
-</button>
-
-          {/* <button
+          <button
             style={navButtonStyle}
-            onClick={() => navigate(`/profile/${currentUser.uid}`)}
+            onClick={() => navigate('/MedicalList')}
           >
-            <FiUser style={{ marginRight: '0.5rem' }} />
-            Profile
-          </button> */}
+            <FiHeart style={{ marginRight: '0.5rem' }} />
+            Medicals
+          </button>
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                <img 
-                  src={currentUser.photoURL || `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.fullName || currentUser.email.split('@')[0])}`} 
-                  alt={currentUser.fullName} 
-                  style={{
-                    width: '36px',
-                    height: '36px',
-                    borderRadius: '50%',
-                    objectFit: 'cover',
-                    border: `2px solid ${colors.white}`
-                    
-                  }}
-                />
-<span 
-  style={{ fontWeight: '500', cursor: 'pointer', color:'black', }} 
-  onClick={() => navigate(`/profile/${currentUser.uid}`)}
->
-  {currentUser.fullName || currentUser.email}
-</span>
-              </div>          
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <img 
+              src={currentUser.photoURL || `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.fullName || currentUser.email.split('@')[0])}`} 
+              alt={currentUser.fullName} 
+              style={{
+                width: '36px',
+                height: '36px',
+                borderRadius: '50%',
+                objectFit: 'cover',
+                border: `2px solid ${colors.white}`
+              }}
+              onError={(e) => {
+                e.target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.fullName || currentUser.email.split('@')[0])}`;
+              }}
+            />
+            <span 
+              style={{ fontWeight: '500', cursor: 'pointer', color:'black' }} 
+              onClick={() => navigate(`/profile/${currentUser.uid}`)}
+            >
+              {currentUser.fullName || currentUser.email}
+            </span>
+          </div>          
 
           <NotificationBell /> 
           
@@ -1055,9 +1301,6 @@ const handleFeedback = async (postId, feedbackType) => {
             <FiLogOut style={{ marginRight: '0.5rem' }} />
             Logout
           </button>
-
-
-
         </div>
       )}
 
@@ -1104,25 +1347,22 @@ const handleFeedback = async (postId, feedbackType) => {
                   fontWeight: '500',
                   color: colors.darkGray,
                   fontSize: '0.9rem'
-                }}>Title</label>
+                }}>Title *</label>
                 <input
                   type="text"
                   placeholder="e.g., 'My Recovery Journey'"
                   value={newPost.title}
                   onChange={(e) => setNewPost({...newPost, title: e.target.value})}
                   required
+                  minLength="5"
+                  maxLength="200"
                   style={{
                     width: '100%',
                     padding: '10px',
                     border: `1px solid ${colors.mediumGray}`,
                     borderRadius: '6px',
                     fontFamily: 'inherit',
-                    transition: 'border 0.2s ease',
-                    ':focus': {
-                      outline: 'none',
-                      borderColor: colors.primary,
-                      boxShadow: `0 0 0 2px ${colors.lightBlue}`
-                    }
+                    transition: 'border 0.2s ease'
                   }}
                 />
               </div>
@@ -1142,13 +1382,7 @@ const handleFeedback = async (postId, feedbackType) => {
                     padding: '10px',
                     border: `1px solid ${colors.mediumGray}`,
                     borderRadius: '6px',
-                    fontFamily: 'inherit',
-                    transition: 'border 0.2s ease',
-                    ':focus': {
-                      outline: 'none',
-                      borderColor: colors.primary,
-                      boxShadow: `0 0 0 2px ${colors.lightBlue}`
-                    }
+                    fontFamily: 'inherit'
                   }}
                 >
                   {healthCategories.map(category => (
@@ -1163,12 +1397,14 @@ const handleFeedback = async (postId, feedbackType) => {
                   fontWeight: '500',
                   color: colors.darkGray,
                   fontSize: '0.9rem'
-                }}>Content</label>
+                }}>Content *</label>
                 <textarea
                   placeholder="Share your health story or advice..."
                   value={newPost.content}
                   onChange={(e) => setNewPost({...newPost, content: e.target.value})}
                   required
+                  minLength="10"
+                  maxLength="5000"
                   style={{
                     width: '100%',
                     padding: '10px',
@@ -1176,13 +1412,7 @@ const handleFeedback = async (postId, feedbackType) => {
                     borderRadius: '6px',
                     fontFamily: 'inherit',
                     minHeight: '150px',
-                    resize: 'vertical',
-                    transition: 'border 0.2s ease',
-                    ':focus': {
-                      outline: 'none',
-                      borderColor: colors.primary,
-                      boxShadow: `0 0 0 2px ${colors.lightBlue}`
-                    }
+                    resize: 'vertical'
                   }}
                 />
               </div>
@@ -1195,22 +1425,17 @@ const handleFeedback = async (postId, feedbackType) => {
                   fontSize: '0.9rem'
                 }}>Image URL (optional)</label>
                 <input
-                  type="text"
+                  type="url"
                   placeholder="https://example.com/image.jpg"
                   value={newPost.image}
                   onChange={(e) => setNewPost({...newPost, image: e.target.value})}
+                  pattern="https?://.+"
                   style={{
                     width: '100%',
                     padding: '10px',
                     border: `1px solid ${colors.mediumGray}`,
                     borderRadius: '6px',
-                    fontFamily: 'inherit',
-                    transition: 'border 0.2s ease',
-                    ':focus': {
-                      outline: 'none',
-                      borderColor: colors.primary,
-                      boxShadow: `0 0 0 2px ${colors.lightBlue}`
-                    }
+                    fontFamily: 'inherit'
                   }}
                 />
               </div>
@@ -1228,11 +1453,7 @@ const handleFeedback = async (postId, feedbackType) => {
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  gap: '8px',
-                  transition: 'background 0.2s ease',
-                  ':hover': {
-                    backgroundColor: editingPost ? '#e9b000' : '#2d8e47'
-                  }
+                  gap: '8px'
                 }}
               >
                 {editingPost ? 'Update Post' : 'Post Update'}
@@ -1253,11 +1474,7 @@ const handleFeedback = async (postId, feedbackType) => {
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    gap: '8px',
-                    transition: 'all 0.2s ease',
-                    ':hover': {
-                      backgroundColor: 'rgba(217,48,37,0.1)'
-                    }
+                    gap: '8px'
                   }}
                   onClick={() => {
                     setEditingPost(null);
@@ -1298,13 +1515,7 @@ const handleFeedback = async (postId, feedbackType) => {
                 borderRadius: '8px',
                 fontFamily: 'inherit',
                 backgroundColor: colors.white,
-                cursor: 'pointer',
-                transition: 'all 0.2s ease',
-                ':focus': {
-                  outline: 'none',
-                  borderColor: colors.primary,
-                  boxShadow: `0 0 0 2px ${colors.lightBlue}`
-                }
+                cursor: 'pointer'
               }}
             >
               <option value="All">All Categories</option>
@@ -1357,12 +1568,7 @@ const handleFeedback = async (postId, feedbackType) => {
                   borderRadius: '8px',
                   overflow: 'hidden',
                   marginBottom: '20px',
-                  boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
-                  transition: 'transform 0.2s ease, box-shadow 0.2s ease',
-                  ':hover': {
-                    transform: 'translateY(-2px)',
-                    boxShadow: '0 4px 8px rgba(0,0,0,0.1)'
-                  }
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
                 }}>
                   {/* Post Header */}
                   <div style={{ 
@@ -1379,8 +1585,10 @@ const handleFeedback = async (postId, feedbackType) => {
                         height: '48px',
                         borderRadius: '50%',
                         objectFit: 'cover',
-                        marginRight: '12px',
-                        border: `2px solid ${colors.lightGray}`
+                        marginRight: '12px'
+                      }}
+                      onError={(e) => {
+                        e.target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(post.authorName)}`;
                       }}
                     />
                     <div style={{ flex: 1 }}>
@@ -1396,7 +1604,7 @@ const handleFeedback = async (postId, feedbackType) => {
                           fontSize: '1.05rem',
                           fontWeight: '600'
                         }}>
-                          {post.authorName}
+                          {DOMPurify.sanitize(post.authorName)}
                         </h3>
                         {post.authorId === currentUser.uid && (
                           <div style={{ display: 'flex', gap: '10px' }}>
@@ -1408,13 +1616,7 @@ const handleFeedback = async (postId, feedbackType) => {
                                 cursor: 'pointer',
                                 fontSize: '0.9rem',
                                 padding: '4px',
-                                borderRadius: '4px',
-                                display: 'flex',
-                                alignItems: 'center',
-                                transition: 'background 0.2s ease',
-                                ':hover': {
-                                  backgroundColor: colors.lightBlue
-                                }
+                                borderRadius: '4px'
                               }}
                               onClick={() => setupEditPost(post)}
                             >
@@ -1428,13 +1630,7 @@ const handleFeedback = async (postId, feedbackType) => {
                                 cursor: 'pointer',
                                 fontSize: '0.9rem',
                                 padding: '4px',
-                                borderRadius: '4px',
-                                display: 'flex',
-                                alignItems: 'center',
-                                transition: 'background 0.2s ease',
-                                ':hover': {
-                                  backgroundColor: 'rgba(217,48,37,0.1)'
-                                }
+                                borderRadius: '4px'
                               }}
                               onClick={() => {
                                 if (window.confirm("Delete this health update?")) {
@@ -1489,13 +1685,12 @@ const handleFeedback = async (postId, feedbackType) => {
                       margin: '0 0 12px 0',
                       fontSize: '1.3rem'
                     }}>
-                      {post.title}
+                      {DOMPurify.sanitize(post.title)}
                     </h2>
                     <div style={{ 
                       position: 'relative',
                       overflow: 'hidden',
-                      maxHeight: expandedPosts[post.id] ? 'none' : '120px',
-                      transition: 'max-height 0.3s ease'
+                      maxHeight: expandedPosts[post.id] ? 'none' : '120px'
                     }}>
                       <p style={{ 
                         color: colors.text, 
@@ -1503,7 +1698,7 @@ const handleFeedback = async (postId, feedbackType) => {
                         lineHeight: '1.6',
                         whiteSpace: 'pre-line'
                       }}>
-                        {post.content}
+                        {DOMPurify.sanitize(post.content)}
                       </p>
                       {post.content.length > 300 && (
                         <div style={{
@@ -1524,13 +1719,7 @@ const handleFeedback = async (postId, feedbackType) => {
                               cursor: 'pointer',
                               display: 'inline-flex',
                               alignItems: 'center',
-                              gap: '5px',
-                              padding: '5px 10px',
-                              borderRadius: '4px',
-                              transition: 'background 0.2s ease',
-                              ':hover': {
-                                backgroundColor: colors.lightBlue
-                              }
+                              gap: '5px'
                             }}
                             onClick={() => toggleExpandPost(post.id)}
                           >
@@ -1556,8 +1745,7 @@ const handleFeedback = async (postId, feedbackType) => {
                           borderRadius: '8px',
                           marginTop: '15px',
                           maxHeight: '400px',
-                          objectFit: 'contain',
-                          backgroundColor: colors.lightGray
+                          objectFit: 'contain'
                         }}
                         onError={(e) => {
                           e.target.style.display = 'none';
@@ -1584,19 +1772,12 @@ const handleFeedback = async (postId, feedbackType) => {
                         cursor: 'pointer',
                         display: 'flex',
                         alignItems: 'center',
-                        gap: '5px',
-                        padding: '5px 10px',
-                        borderRadius: '4px',
-                        transition: 'all 0.2s ease',
-                        ':hover': {
-                          backgroundColor: colors.lightGray
-                        }
+                        gap: '5px'
                       }}
                       onClick={() => handleFeedback(post.id, 'useful')}
                     >
                       <MdThumbUp style={{ 
-                        color: post.useful?.includes(currentUser.uid) ? colors.primary : colors.darkGray,
-                        fontSize: '1.1rem'
+                        color: post.useful?.includes(currentUser.uid) ? colors.primary : colors.darkGray
                       }} /> 
                       Useful ({post.useful?.length || 0})
                     </button>
@@ -1609,19 +1790,12 @@ const handleFeedback = async (postId, feedbackType) => {
                         cursor: 'pointer',
                         display: 'flex',
                         alignItems: 'center',
-                        gap: '5px',
-                        padding: '5px 10px',
-                        borderRadius: '4px',
-                        transition: 'all 0.2s ease',
-                        ':hover': {
-                          backgroundColor: colors.lightGray
-                        }
+                        gap: '5px'
                       }}
                       onClick={() => handleFeedback(post.id, 'notUseful')}
                     >
                       <MdThumbDown style={{ 
-                        color: post.notUseful?.includes(currentUser.uid) ? colors.primary : colors.darkGray,
-                        fontSize: '1.1rem'
+                        color: post.notUseful?.includes(currentUser.uid) ? colors.primary : colors.darkGray
                       }} />
                       Not Useful ({post.notUseful?.length || 0})
                     </button>
@@ -1642,13 +1816,15 @@ const handleFeedback = async (postId, feedbackType) => {
                               objectFit: 'cover',
                               flexShrink: 0
                             }}
+                            onError={(e) => {
+                              e.target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(comment.authorName)}`;
+                            }}
                           />
                           <div style={{ flex: 1 }}>
                             <div style={{ 
                               backgroundColor: colors.lightGray,
                               padding: '10px 12px',
-                              borderRadius: '18px',
-                              position: 'relative'
+                              borderRadius: '18px'
                             }}>
                               <div style={{ 
                                 display: 'flex', 
@@ -1662,7 +1838,7 @@ const handleFeedback = async (postId, feedbackType) => {
                                     fontSize: '0.9rem',
                                     color: colors.text
                                   }}>
-                                    {comment.authorName}
+                                    {DOMPurify.sanitize(comment.authorName)}
                                   </strong>
                                   <span style={{ 
                                     fontSize: '0.75rem', 
@@ -1685,15 +1861,8 @@ const handleFeedback = async (postId, feedbackType) => {
                                       cursor: 'pointer',
                                       fontSize: '0.8rem',
                                       padding: '2px 5px',
-                                      borderRadius: '4px',
-                                      display: 'flex',
-                                      alignItems: 'center',
-                                      transition: 'background 0.2s ease',
-                                      ':hover': {
-                                        backgroundColor: 'rgba(217,48,37,0.1)'
-                                      }
+                                      borderRadius: '4px'
                                     }}
-                                    aria-label="Delete comment"
                                   >
                                     Delete
                                   </button>
@@ -1704,7 +1873,7 @@ const handleFeedback = async (postId, feedbackType) => {
                                 fontSize: '0.9rem',
                                 lineHeight: '1.5'
                               }}>
-                                {comment.content}
+                                {DOMPurify.sanitize(comment.content)}
                               </p>
                             </div>
                             
@@ -1726,6 +1895,9 @@ const handleFeedback = async (postId, feedbackType) => {
                                     objectFit: 'cover',
                                     flexShrink: 0
                                   }}
+                                  onError={(e) => {
+                                    e.target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(reply.authorName)}`;
+                                  }}
                                 />
                                 <div style={{ flex: 1 }}>
                                   <div style={{ 
@@ -1745,7 +1917,7 @@ const handleFeedback = async (postId, feedbackType) => {
                                           fontSize: '0.85rem',
                                           color: colors.text
                                         }}>
-                                          {reply.authorName}
+                                          {DOMPurify.sanitize(reply.authorName)}
                                         </strong>
                                         <span style={{ 
                                           fontSize: '0.7rem', 
@@ -1768,15 +1940,8 @@ const handleFeedback = async (postId, feedbackType) => {
                                             cursor: 'pointer',
                                             fontSize: '0.7rem',
                                             padding: '2px 5px',
-                                            borderRadius: '4px',
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            transition: 'background 0.2s ease',
-                                            ':hover': {
-                                              backgroundColor: 'rgba(217,48,37,0.1)'
-                                            }
+                                            borderRadius: '4px'
                                           }}
-                                          aria-label="Delete reply"
                                         >
                                           Delete
                                         </button>
@@ -1787,7 +1952,7 @@ const handleFeedback = async (postId, feedbackType) => {
                                       fontSize: '0.85rem',
                                       lineHeight: '1.5'
                                     }}>
-                                      {reply.content}
+                                      {DOMPurify.sanitize(reply.content)}
                                     </p>
                                   </div>
                                 </div>
@@ -1812,19 +1977,14 @@ const handleFeedback = async (postId, feedbackType) => {
                                     [key]: e.target.value
                                   });
                                 }}
+                                maxLength="1000"
                                 style={{
                                   flex: 1,
                                   padding: '8px 12px',
                                   border: `1px solid ${colors.mediumGray}`,
                                   borderRadius: '18px',
                                   fontFamily: 'inherit',
-                                  fontSize: '0.9rem',
-                                  transition: 'border 0.2s ease',
-                                  ':focus': {
-                                    outline: 'none',
-                                    borderColor: colors.primary,
-                                    boxShadow: `0 0 0 2px ${colors.lightBlue}`
-                                  }
+                                  fontSize: '0.9rem'
                                 }}
                                 onKeyPress={(e) => {
                                   if (e.key === 'Enter') {
@@ -1852,11 +2012,7 @@ const handleFeedback = async (postId, feedbackType) => {
                                   borderRadius: '18px',
                                   fontWeight: '600',
                                   cursor: 'pointer',
-                                  fontSize: '0.9rem',
-                                  transition: 'background 0.2s ease',
-                                  ':hover': {
-                                    backgroundColor: '#1557b7'
-                                  }
+                                  fontSize: '0.9rem'
                                 }}
                               >
                                 Reply
@@ -1879,6 +2035,9 @@ const handleFeedback = async (postId, feedbackType) => {
                           objectFit: 'cover',
                           flexShrink: 0
                         }}
+                        onError={(e) => {
+                          e.target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.fullName || currentUser.email.split('@')[0])}`;
+                        }}
                       />
                       <input
                         type="text"
@@ -1888,6 +2047,7 @@ const handleFeedback = async (postId, feedbackType) => {
                           ...prev, 
                           [post.id]: e.target.value
                         }))}
+                        maxLength="1000"
                         style={{
                           flex: 1,
                           padding: '10px 15px',
@@ -1990,13 +2150,15 @@ const handleFeedback = async (postId, feedbackType) => {
                   fontWeight: '500',
                   color: colors.darkGray,
                   fontSize: '0.9rem'
-                }}>Title</label>
+                }}>Title *</label>
                 <input
                   type="text"
                   placeholder="e.g., 'My Recovery Journey'"
                   value={newPost.title}
                   onChange={(e) => setNewPost({...newPost, title: e.target.value})}
                   required
+                  minLength="5"
+                  maxLength="200"
                   style={{
                     width: '100%',
                     padding: '12px',
@@ -2039,12 +2201,14 @@ const handleFeedback = async (postId, feedbackType) => {
                   fontWeight: '500',
                   color: colors.darkGray,
                   fontSize: '0.9rem'
-                }}>Content</label>
+                }}>Content *</label>
                 <textarea
                   placeholder="Share your health story or advice..."
                   value={newPost.content}
                   onChange={(e) => setNewPost({...newPost, content: e.target.value})}
                   required
+                  minLength="10"
+                  maxLength="5000"
                   style={{
                     width: '100%',
                     padding: '12px',
@@ -2066,10 +2230,11 @@ const handleFeedback = async (postId, feedbackType) => {
                   fontSize: '0.9rem'
                 }}>Image URL (optional)</label>
                 <input
-                  type="text"
+                  type="url"
                   placeholder="https://example.com/image.jpg"
                   value={newPost.image}
                   onChange={(e) => setNewPost({...newPost, image: e.target.value})}
+                  pattern="https?://.+"
                   style={{
                     width: '100%',
                     padding: '12px',
@@ -2142,11 +2307,7 @@ const handleFeedback = async (postId, feedbackType) => {
             justifyContent: 'center',
             boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
             cursor: 'pointer',
-            zIndex: 100,
-            transition: 'transform 0.2s ease, box-shadow 0.2s ease',
-            ':active': {
-              transform: 'scale(0.95)'
-            }
+            zIndex: 100
           }}
           onClick={() => {
             setShowCreatePost(true);

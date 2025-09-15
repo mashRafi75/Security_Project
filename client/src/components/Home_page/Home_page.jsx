@@ -42,6 +42,7 @@ const HomePage = () => {
   const notificationsRef = useRef(null);
   const { currentUser } = useAuth();
 
+
   // Rate limiting state
   const [lastSubmissionTime, setLastSubmissionTime] = useState(0);
   const [submissionAttempts, setSubmissionAttempts] = useState(0);
@@ -61,6 +62,7 @@ const HomePage = () => {
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [status, setStatus] = useState("");
+
 
   // Enhanced input validation
   const validateInput = (name, value) => {
@@ -90,12 +92,13 @@ const HomePage = () => {
     }));
   };
 
+
   // Rate limiting for form submissions
   const canSubmitForm = () => {
     const now = Date.now();
     const timeDiff = now - lastSubmissionTime;
     
-    if (timeDiff < 30000) { // 30 second cooldown
+    if (timeDiff < 30000) { // for 30 second cooldown
       if (submissionAttempts >= 3) {
         setStatus("Too many attempts. Please wait 30 seconds.");
         return false;
@@ -171,7 +174,7 @@ const HomePage = () => {
     setMobileMenuOpen(!mobileMenuOpen);
   };
 
-  // Secure search query handling
+  // Secure search query
   const handleSearch = (e) => {
     e.preventDefault();
     const sanitizedQuery = DOMPurify.sanitize(searchQuery.trim());
@@ -180,7 +183,7 @@ const HomePage = () => {
     }
   };
 
-  // Secure AI question handling
+  // Secure AI question
   const handleAiSubmit = (e) => {
     e.preventDefault();
     const sanitizedQuestion = DOMPurify.sanitize(aiQuestion.trim());
